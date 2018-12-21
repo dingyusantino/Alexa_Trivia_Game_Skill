@@ -1,1 +1,1 @@
-Amazon Alexa Trivia Game
+2017_Alexa_Christmas_Trivia skill

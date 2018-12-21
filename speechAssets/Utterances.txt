@@ -1,0 +1,16 @@
+AnswerIntent {Answer}
+AnswerIntent option {Answer}
+AnswerIntent I think its {Answer}
+AnswerIntent Its probably {Answer}
+AnswerIntent It must be {Answer}
+AnswerIntent Its gotta be {Answer}
+DontKnowIntent No idea
+DontKnowIntent Im not sure
+DontKnowIntent i dont know
+DontKnowIntent dont know
+DontKnowIntent i dont know that one
+DontKnowIntent dunno
+DontKnowIntent skip
+DontKnowIntent i dont know that
+DontKnowIntent who knows
+DontKnowIntent i dont know this question

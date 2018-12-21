@@ -1,0 +1,260 @@
+node{
+  try {
+    // Here we build the required files and archive them if necessary
+    stage ('Build') {
+      // The checkout step will checkout code from source control
+      checkout scm
+      sh '''#!/bin/bash
+        # Set SSH Key
+        eval `ssh-agent -s`
+        ssh-add ~/.ssh/id_rsa
+        touch ~/.ssh/known_hosts
+        ssh-keyscan -H bitbucket.org >> ~/.ssh/known_hosts
+
+        # Install the node js packages
+        npm install > /dev/null
+
+        # Set ENV_VARIABLE so that skill will read env file
+        export ENV_VARIABLE=true
+        
+        # Run the test cases
+        # rm RESULT
+        # npm test || { `echo fail > RESULT` && exit; }
+
+        # Zip the files that we need to submit (Remember to exclude unnecessary files)
+        mkdir submission
+        rm Archive.zip
+        rm submission/index.zip
+        rm -r bin include lib pip-selfcheck.json
+        zip -X -r submission/index.zip * \
+          -x publish.sh submission/* submission document.json index.zip > /dev/null
+      '''
+
+      // Record the test result
+      def testResult = '';
+      //  if(fileExists('RESULT')) {
+      //    testResult = readFile('RESULT').trim();
+      //  }
+      //  if(testResult == 'fail') {
+        //  error('npm test failed');
+      //  } else {
+        archiveArtifacts artifacts: 'submission/index.zip'
+      //  }
+    }
+
+    stage ('Deploy to AWS'){
+      // Retrieve credientials from Jenkins builtin
+      println(env.BRANCH_NAME);
+      println(env.BRANCH_NAME == 'master' ? 
+            'dmp-account-credential-fdg-mgmt' : 
+            'dmp-sandbox-account-credential-fdg-mgmt');
+      withCredentials([
+        usernamePassword(
+          credentialsId: env.BRANCH_NAME == 'master' ? 
+            'dmp-account-credential-fdg-mgmt' : 
+            'dmp-sandbox-account-credential-fdg-mgmt',
+          usernameVariable: 'ACCOUNT_KEY_ID',
+          passwordVariable: 'ACCOUNT_SECRET_KEY')
+        ]
+      ){
+
+        sh script:'''#!/bin/bash +x
+          # Activate virtual environment
+          virtualenv venv
+          source venv/bin/activate
+          cd submission
+      
+          # Set up environment variable. Remember to change them when
+          # switch to stage or live
+          git name-rev --name-only HEAD > BRANCH_NAME
+          echo ${BRANCH_NAME}
+          if [ "${BRANCH_NAME}" == "master" ]; then
+            PROFILE=AlexaDeveloper
+            FNAME=2017_Alexa_Christmas_Trivia
+            ALIAS=LIVE
+            declare -a OTHER_ALIASES=(staging LIVE-1)
+            DMP_MODE=live 
+            APP_ID=amzn1.ask.skill.bd754c14-5bdd-4df8-bb1d-3d131cce7052
+            TOKEN_URI=management.beyondvoice.freshdigitalgroup.com
+            REG_URI=http://api.beyondvoice.freshdigitalgroup.com/v1/management/accounts
+            ACCOUNT_ID=75e0753e-2e08-4d8d-9c7d-5a65824e828c
+          else
+            PROFILE=AlexaDeveloper
+            FNAME=2017_Alexa_Christmas_Trivia
+            ALIAS=staging
+            declare -a OTHER_ALIASES=(LIVE LIVE-1)
+            DMP_MODE=sandbox 
+            APP_ID=amzn1.ask.skill.bd754c14-5bdd-4df8-bb1d-3d131cce7052
+            TOKEN_URI=management.sandbox.beyondvoice.freshdigitalgroup.com
+            REG_URI=http://api.sandbox.beyondvoice.freshdigitalgroup.com/v1/management/accounts
+            ACCOUNT_ID=75e0753e-2e08-4d8d-9c7d-5a65824e828c
+          fi
+
+          echo ${ACCOUNT_ID}
+
+          # Get access token to have the key to our DMP system
+          ACCESS_TOKEN=`curl -d "client_id=${ACCOUNT_KEY_ID}&\
+            client_secret=${ACCOUNT_SECRET_KEY}&\
+            redirect_uri=${TOKEN_URI}/oauth/applications&\
+            grant_type=client_credentials&\
+            code=CODE" ${TOKEN_URI}/oauth/token \
+            | jq '.access_token' \
+            | awk '{gsub(/[",]/, "", $1);print $1}'`
+
+          echo "client_id=${ACCOUNT_KEY_ID}&\
+            client_secret=${ACCOUNT_SECRET_KEY}&\
+            redirect_uri=${TOKEN_URI}/oauth/applications&\
+            grant_type=client_credentials&\
+            code=CODE"
+          echo ${ACCESS_TOKEN}
+
+          # Get the bots list and certain bot id
+          SKILL_LIST=`curl -X GET \
+            --header "Accept: application/json" \
+            --header "Authorization: Bearer $ACCESS_TOKEN" \
+            $REG_URI/$ACCOUNT_ID/skills`
+
+          SKILL_ID=`echo $SKILL_LIST \
+            | jq --arg f "$FNAME" '.data|.[]|select(.name==$f)|.id' \
+            | awk '{gsub(/[",]/, "", $1);print $1}'`
+
+          # Check if our bot exists or not, if exist get info,
+          # if not create a new one
+          if [ -z $SKILL_ID ]; then
+            SKILL_INFO=$(curl -X POST \
+              --header "Content-Type:application/json" \
+              --header "Authorization: Bearer $ACCESS_TOKEN" \
+              -d "{ \
+                name:$FNAME, \
+                application:{ \
+                  scopes:public, \
+                  redirect_uri:https://fdg.beyondvoice.freshdigitalgroup.com/ \
+                } \
+              }" \
+              $REG_URI/$ACCOUNT_ID/skills)
+          else
+            SKILL_INFO=$(curl -X GET \
+              --header "Accept: application/json" \
+              --header "Authorization: Bearer $ACCESS_TOKEN" \
+              $REG_URI/$ACCOUNT_ID/skills/$SKILL_ID)
+          fi
+
+          echo $SKILL_INFO
+
+          # Get the client_id and client_secret which will
+          # be push to our lambda function
+          CLIENT_ID=`echo $SKILL_INFO \
+            | jq '.data|.oauth_application|.uid' \
+            | awk '{gsub(/[",]/, "", $1);print $1}'` 
+          CLIENT_SECRET=`echo $SKILL_INFO \
+            | jq '.data|.oauth_application|.secret' \
+            | awk '{gsub(/[",]/, "", $1);print $1}'`
+
+          # GET Total number of functions
+          echo $PROFILE
+          FUNCTION_AMT=`aws lambda list-versions-by-function \
+            --function-name $FNAME --profile $PROFILE \
+            | jq '.Versions|length'`
+
+          # Update function or create a new one if not exits
+          { aws lambda update-function-code --function-name $FNAME \
+              --profile $PROFILE --zip-file fileb://index.zip \
+            || \
+            aws lambda create-function --function-name $FNAME \
+              --profile $PROFILE --runtime "nodejs6.10" --timeout 30 \
+              --environment "Variables={ \
+                ACCOUNT_ID=$ACCOUNT_ID, \
+                CLIENT_ID=$CLIENT_ID, \
+                CLIENT_SECRET=$CLIENT_SECRET, \
+                DMP_MODE=$DMP_MODE, \
+                APP_ID=$APP_ID}" \
+              --role arn:aws:iam::679125658632:role/lambda_basic_execution \
+              --handler "index.handler" --zip-file fileb://index.zip; \
+          } \
+          | grep Version | awk \'{gsub(/[",]/, "", $2); print $2}\'
+
+          aws lambda update-function-configuration \
+            --function-name $FNAME \
+            --profile $PROFILE \
+            --environment "Variables={ \
+              ACCOUNT_ID=$ACCOUNT_ID, \
+              CLIENT_ID=$CLIENT_ID, \
+              CLIENT_SECRET=$CLIENT_SECRET, \
+              DMP_MODE=$DMP_MODE, \
+              APP_ID=$APP_ID}" >/dev/null
+
+          # Publish a new version and get the new version number
+          version=`aws lambda publish-version \
+            --function-name $FNAME --profile $PROFILE \
+            | grep Version | awk \'{gsub(/[",]/, "", $2); print $2}\'`
+
+          # Point the alias to the newly updated one
+          aws lambda update-alias --function-name $FNAME --name $ALIAS \
+            --profile $PROFILE --function-version $version || \
+          aws lambda create-alias --function-name $FNAME --name $ALIAS \
+            --profile $PROFILE --function-version $version >/dev/null
+
+          if [ $? == 255 ]; then 
+            aws lambda create-alias --function-name $FNAME \
+              --profile $PROFILE --name $ALIAS --function-version $version; 
+          fi
+
+          # Avoid delete other alias function versions
+          OTHER_ALIAS_VERSIONS=()
+
+          for alias in "${OTHER_ALIASES[@]}"
+          do
+            echo "$alias"
+            VERSION=`echo $(aws lambda list-aliases \
+              --function-name $FNAME --profile $PROFILE) \
+              | jq --arg temp $alias \
+                '.Aliases|.[]|select(.Name==$temp)|.FunctionVersion' \
+              | awk '{gsub(/[",]/, "", $1);print $1}'`
+            OTHER_ALIAS_VERSIONS+=($VERSION)
+          done
+
+          # Delete the exceeded function versions
+          if [ $FUNCTION_AMT -gt 5 ]; then
+            START_VERSION=`aws lambda list-versions-by-function \
+              --function-name $FNAME --profile $PROFILE \
+              | jq '.Versions[1].Version' \
+              | awk '{gsub(/[",]/, "", $1);print $1}'`
+            echo $START_VERSION
+            echo $FUNCTION_AMT
+            for ((i=$START_VERSION; i < $START_VERSION + $FUNCTION_AMT - 5; ++i))
+            do
+              if [[ "${OTHER_ALIAS_VERSIONS[*]}" == "$i" ]]; then
+                aws lambda delete-function \
+                  --function-name $FNAME --qualifier $i --profile DeleteRole
+              fi
+            done
+          fi
+        deactivate'''
+      }
+    }
+  } catch (e) {
+    currentBuild.result = "FAILURE"
+    throw e
+  } finally {
+    if(currentBuild.result != currentBuild.previousBuild.result ||
+      currentBuild.result != "FAILURE") {
+      notifyBuild(currentBuild.result)
+    }
+  }
+}
+
+// Notify the slack success or fail
+def notifyBuild(buildStatus) {
+  buildStatus =  buildStatus ?: 'SUCCESS'
+  def summary = ""
+  if (buildStatus == 'SUCCESS') {
+    color = 'GREEN'
+    colorCode = '#00FF00'
+    summary = "Publish ${env.JOB_NAME} Success"
+  } else {
+    color = 'RED'
+    colorCode = '#FF0000'
+    summary = "Publish ${env.JOB_NAME} Fail"
+  }
+  slackSend (color: colorCode, message: summary)
+}
