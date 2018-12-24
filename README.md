@@ -1,2 +1,2 @@
-2017_Alexa_Christmas_Trivia skill
+Alexa_Christmas_Trivia skill
 Node.js
